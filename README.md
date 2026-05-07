@@ -33,8 +33,8 @@ minutos.
 ### 1. Cloná el repo
 
 ```bash
-git clone https://github.com/<tu-usuario>/utn-frc-monitor.git
-cd utn-frc-monitor
+git clone https://github.com/<tu-usuario>/AgenteUTN.git
+cd AgenteUTN
 ```
 
 ### 2. Instalá las dependencias
@@ -241,5 +241,3 @@ MIT — ver [LICENSE](LICENSE).
 
 Si encontrás un bug, un selector que rompió, o se te ocurre una feature, abrí
 un issue o un PR. Bienvenidos los aportes de otros estudiantes de UTN.
-#   A g e n t e U T N  
- 
