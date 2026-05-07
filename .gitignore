@@ -1,0 +1,41 @@
+# Variables de entorno con credenciales — NUNCA subir
+.env
+.env.local
+.env.*.local
+
+# Estado local del bot (chat_id, mensajes vistos, snapshot de notas)
+utn_seen_messages.json
+utn_grades_state.json
+utn_telegram_chat_id.txt
+utn_telegram_chat_id.txt.txt
+
+# Logs
+utn_monitor*.log
+utn_monitor*.log.*
+
+# Backups y debug local
+utn_monitor*.py.bak
+debug/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+venv/
+.venv/
+env/
+
+# Editores / IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
