@@ -233,10 +233,6 @@ separada o usando `actions/cache`, pero queda como ejercicio.
 - El uso del scraping puede chocar con los términos de uso de UTN FRC. Lo
   publicamos con fines educativos. Usalo bajo tu responsabilidad.
 
-## Licencia
-
-MIT — ver [LICENSE](LICENSE).
-
 ## Aporte
 
 Si encontrás un bug, un selector que rompió, o se te ocurre una feature, abrí
