@@ -660,9 +660,16 @@ def _extract_grades(page: Page) -> tuple[list[dict], dict]:
       - notificaciones: dicts con tipo (nueva|modificada), curso_id, curso_nombre,
                         titulo (instancia), valor [, valor_anterior].
       - estado: {cursoId: {nota1: '...', ..., notafinal: '...'}}.
+
+    Implementación: el endpoint `/4/cursado/materias/notas/{cid}` requiere
+    headers A4-Token / A4-TimeStamp / A4-Data efímeros que jQuery genera vía
+    un ajaxPrefilter solo cuando la llamada se dispara desde el click del modal
+    "Mis Parciales". Por eso simulamos el click para cada materia (igual que
+    `_download_via_browser` hace para los adjuntos), interceptamos el XHR y
+    leemos la respuesta capturada.
     """
     # Lista de cursos del panel "Materias (YYYY)" — siempre el año vigente por defecto.
-    js = (
+    list_js = (
         "() => Array.from(document.querySelectorAll('li[id^=\"idCurso\"]'))"
         ".map(li => ({"
         " id: li.id.replace(/^idCurso/, ''),"
@@ -671,7 +678,7 @@ def _extract_grades(page: Page) -> tuple[list[dict], dict]:
         "}))"
     )
     try:
-        cursos = page.evaluate(js)
+        cursos = page.evaluate(list_js)
     except Exception as e:
         log.warning("a4-notas: no se pudo evaluar lista de cursos: %s", e)
         return [], {}
@@ -679,79 +686,160 @@ def _extract_grades(page: Page) -> tuple[list[dict], dict]:
         log.info("a4-notas: panel Materias vacío.")
         return [], {}
     log.info("a4-notas: %d curso(s) inscriptos.", len(cursos))
+
+    # Instalar interceptor de XHR para capturar respuestas de los endpoints.
+    page.evaluate("""() => {
+      window.__notas_cap = {};
+      if (window.__notas_patched) return;
+      window.__notas_patched = true;
+      const oo = XMLHttpRequest.prototype.open;
+      XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+        this.__url = String(url);
+        this.addEventListener('loadend', () => {
+          const u = this.__url;
+          const mt = u.match(/\\/4\\/academico\\/notas\\/titulos\\/([^?]+)/);
+          const mn = u.match(/\\/4\\/cursado\\/materias\\/notas\\/([^?]+)/);
+          if (mt) {
+            const cid = mt[1];
+            (window.__notas_cap[cid] = window.__notas_cap[cid] || {}).titulos =
+              { s: this.status, b: this.responseText || '' };
+          } else if (mn) {
+            const cid = mn[1];
+            (window.__notas_cap[cid] = window.__notas_cap[cid] || {}).notas =
+              { s: this.status, b: this.responseText || '' };
+          }
+        });
+        return oo.call(this, method, url, ...rest);
+      };
+    }""")
+
+    # Por cada curso: click "Mis Parciales", esperar respuesta, cerrar modal.
+    for c in cursos:
+        cid = c.get("id") or ""
+        if not cid:
+            continue
+        # Reset por curso (por si quedó algo de una corrida anterior)
+        page.evaluate(f"() => {{ delete window.__notas_cap['{cid}']; }}")
+        # El ícono "Mis Parciales" está oculto por CSS hasta hover, así que
+        # Playwright.click() falla con "element is not visible". Disparamos el
+        # click() del DOM directamente via JS — el handler de jQuery se
+        # ejecuta igual y abre el modal.
+        try:
+            clicked = page.evaluate(f"""() => {{
+              const el = document.querySelector('#idCurso{cid} i[title="Mis Parciales"]');
+              if (!el) return false;
+              el.click();
+              return true;
+            }}""")
+        except Exception as e:
+            log.warning("a4-notas: evaluate click %s falló: %s", cid, e)
+            continue
+        if not clicked:
+            log.warning("a4-notas: no se encontró ícono 'Mis Parciales' para %s", cid)
+            continue
+        # Esperar a que llegue al menos la respuesta de /notas/ (la de titulos
+        # casi siempre llega primero o en paralelo).
+        try:
+            page.wait_for_function(
+                "(cid) => window.__notas_cap[cid] && window.__notas_cap[cid].notas",
+                arg=cid,
+                timeout=15_000,
+            )
+        except Exception as e:
+            log.warning("a4-notas: timeout esperando respuesta %s: %s", cid, e)
+        # Cerrar modal (click en Cancelar). Si no hay modal abierto, ignorar.
+        try:
+            page.evaluate("""() => {
+              const cancel = [...document.querySelectorAll('.modal.in button, .modal.show button')]
+                .find(b => /cancelar/i.test(b.textContent));
+              if (cancel) cancel.click();
+            }""")
+            page.wait_for_timeout(400)
+        except Exception:
+            pass
+
+    # Leer todo lo capturado y procesar.
+    captured = page.evaluate("() => window.__notas_cap || {}") or {}
     previous = load_grades_state()
     is_first_run = not previous
     new_state = dict(previous)
     notifs: list[dict] = []
+
     for c in cursos:
         cid = c.get("id") or ""
         nombre = c.get("nombre") or cid
         if not cid:
             continue
-        try:
-            tr = page.request.get(GRADE_TITULOS_URL.format(cid=cid))
-            if tr.status != 200:
-                log.debug("a4-notas: titulos %s status %s", cid, tr.status)
-                continue
-            titulos_text = tr.text()
+        entry = captured.get(cid, {}) or {}
+        tit = entry.get("titulos") or {}
+        nt = entry.get("notas") or {}
+        # Parsear títulos (pipe-separated).
+        if tit.get("s") == 200:
+            titulos_text = tit.get("b", "") or ""
             titulos = titulos_text.split("|")
             if titulos and titulos[-1] == "":
                 titulos = titulos[:-1]
-            nr = page.request.get(GRADE_NOTAS_URL.format(cid=cid))
-            if nr.status == 204:
-                # Sin notas cargadas: preservar estado previo (no pisar con vacío).
-                new_state[cid] = previous.get(cid, {})
+        else:
+            log.debug("a4-notas: titulos %s status %s", cid, tit.get("s"))
+            titulos = []
+        # Notas.
+        n_status = nt.get("s")
+        if n_status == 204 or (n_status == 200 and not nt.get("b")):
+            new_state[cid] = previous.get(cid, {})
+            continue
+        if n_status != 200:
+            log.debug("a4-notas: notas %s status %s", cid, n_status)
+            continue
+        try:
+            data = json.loads(nt.get("b") or "")
+        except Exception as je:
+            log.debug("a4-notas: JSON parse %s falló: %s", cid, je)
+            continue
+        if not isinstance(data, list) or not data:
+            new_state[cid] = previous.get(cid, {})
+            continue
+        row = data[0]
+        # Tratar None como string vacío (el JSON viene con `null` cuando la
+        # nota no está cargada, y str(None) = "None" rompería la comparación).
+        current = {
+            k: ("" if v is None else str(v))
+            for k, v in row.items()
+            if k.startswith("nota")
+        }
+        new_state[cid] = current
+        prev_curso = previous.get(cid, {})
+        for key, valor_nuevo in current.items():
+            titulo = ""
+            m = re.match(r"^nota(\d+)$", key)
+            if m:
+                idx = int(m.group(1)) - 1
+                if 0 <= idx < len(titulos):
+                    titulo = titulos[idx].strip()
+            elif key == "notafinal":
+                titulo = "Promedio"
+            if not titulo or titulo == ".":
                 continue
-            if nr.status != 200:
-                log.debug("a4-notas: notas %s status %s", cid, nr.status)
+            if is_empty_grade(valor_nuevo):
                 continue
-            try:
-                data = nr.json()
-            except Exception as je:
-                log.debug("a4-notas: JSON parse %s falló: %s", cid, je)
-                continue
-            if not isinstance(data, list) or not data:
-                new_state[cid] = previous.get(cid, {})
-                continue
-            row = data[0]
-            current = {k: str(v) for k, v in row.items() if k.startswith("nota")}
-            new_state[cid] = current
-            prev_curso = previous.get(cid, {})
-            for key, valor_nuevo in current.items():
-                titulo = ""
-                m = re.match(r"^nota(\d+)$", key)
-                if m:
-                    idx = int(m.group(1)) - 1
-                    if 0 <= idx < len(titulos):
-                        titulo = titulos[idx].strip()
-                elif key == "notafinal":
-                    titulo = "Promedio"
-                if not titulo or titulo == ".":
-                    continue
-                if is_empty_grade(valor_nuevo):
-                    continue
-                valor_anterior = prev_curso.get(key, "")
-                if is_empty_grade(valor_anterior):
-                    if not is_first_run:
-                        notifs.append({
-                            "tipo": "nueva",
-                            "curso_id": cid,
-                            "curso_nombre": nombre,
-                            "titulo": titulo,
-                            "valor": valor_nuevo,
-                        })
-                elif str(valor_anterior) != str(valor_nuevo):
+            valor_anterior = prev_curso.get(key, "")
+            if is_empty_grade(valor_anterior):
+                if not is_first_run:
                     notifs.append({
-                        "tipo": "modificada",
+                        "tipo": "nueva",
                         "curso_id": cid,
                         "curso_nombre": nombre,
                         "titulo": titulo,
                         "valor": valor_nuevo,
-                        "valor_anterior": valor_anterior,
                     })
-        except Exception as e:
-            log.warning("a4-notas: %s falló: %s", cid, e)
-            continue
+            elif str(valor_anterior) != str(valor_nuevo):
+                notifs.append({
+                    "tipo": "modificada",
+                    "curso_id": cid,
+                    "curso_nombre": nombre,
+                    "titulo": titulo,
+                    "valor": valor_nuevo,
+                    "valor_anterior": valor_anterior,
+                })
     if is_first_run:
         log.info("a4-notas: primera corrida — snapshot inicial guardado, sin notif.")
     else:
