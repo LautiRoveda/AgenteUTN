@@ -70,6 +70,10 @@ MAX_ATTEMPTS     = 3
 RETRY_DELAY_BASE = 5
 NAV_TIMEOUT_MS   = 45_000
 DEFAULT_TIMEOUT  = 30_000
+# a4 suele estar lento (sobre todo de noche / horas pico). Le damos más aire
+# para evitar timeouts y reintentos que disparan falsos "login rechazado".
+A4_NAV_TIMEOUT     = 60_000
+A4_SELECTOR_TIMEOUT = 30_000
 TG_INTER_MSG_SLEEP = 0.4
 MAX_DOC_SIZE_MB = 49
 MAX_DOC_SIZE    = MAX_DOC_SIZE_MB * 1024 * 1024
@@ -631,18 +635,20 @@ def _extract_a3(page: Page) -> list[dict]:
 def _extract_a4(page: Page) -> list[dict]:
     """Lee ul#listaMensajes de Autogestión 4."""
     try:
-        page.goto(UTN_A4_DASH, wait_until="domcontentloaded", timeout=DEFAULT_TIMEOUT)
+        page.goto(UTN_A4_DASH, wait_until="domcontentloaded", timeout=A4_NAV_TIMEOUT)
     except PWTimeout as e:
         raise TransientError(f"No cargó a4: {e}")
     try:
-        page.wait_for_selector("ul#listaMensajes", state="attached", timeout=15_000)
+        page.wait_for_selector("ul#listaMensajes", state="attached",
+                               timeout=A4_SELECTOR_TIMEOUT)
         page.wait_for_selector(
             'ul#listaMensajes li[id^="idMensaje"]',
-            state="attached", timeout=15_000,
+            state="attached", timeout=A4_SELECTOR_TIMEOUT,
         )
     except PWTimeout:
         _save_debug(page, "a4-no-timeline")
-        log.warning("a4: listaMensajes no tuvo ítems en 15s, parseo lo que haya")
+        log.warning("a4: listaMensajes no tuvo ítems en %ds, parseo lo que haya",
+                    A4_SELECTOR_TIMEOUT // 1000)
     html = page.content()
     msgs = parse_a4_timeline(html)
     log.info("a4 timeline: %d mensajes", len(msgs))
@@ -652,14 +658,17 @@ def _logout(page: Page) -> None:
         page.goto(UTN_LOGOUT, wait_until="domcontentloaded", timeout=15_000)
     except Exception as e:
         log.debug("Logout ignorado: %s", e)
-def _extract_grades(page: Page) -> tuple[list[dict], dict]:
+def _extract_grades(page: Page) -> tuple[list[dict], Optional[dict]]:
     """
     Lee las calificaciones de cada materia inscripta del año vigente desde a4.
     Asume que la page YA tiene sesión iniciada y que recién se cargó UTN_A4_DASH
     (lo deja _extract_a4). Devuelve (notificaciones, estado_actualizado).
       - notificaciones: dicts con tipo (nueva|modificada), curso_id, curso_nombre,
                         titulo (instancia), valor [, valor_anterior].
-      - estado: {cursoId: {nota1: '...', ..., notafinal: '...'}}.
+      - estado: {cursoId: {nota1: '...', ..., notafinal: '...'}} cuando se
+                pudo refrescar; None si el panel de Materias vino vacío o no
+                se pudo leer (en ese caso fetch_and_notify NO sobrescribe el
+                snapshot, preservando el estado real de corridas previas).
 
     Implementación: el endpoint `/4/cursado/materias/notas/{cid}` requiere
     headers A4-Token / A4-TimeStamp / A4-Data efímeros que jQuery genera vía
@@ -680,11 +689,13 @@ def _extract_grades(page: Page) -> tuple[list[dict], dict]:
     try:
         cursos = page.evaluate(list_js)
     except Exception as e:
-        log.warning("a4-notas: no se pudo evaluar lista de cursos: %s", e)
-        return [], {}
+        log.warning("a4-notas: no se pudo evaluar lista de cursos: %s "
+                    "(snapshot NO se sobrescribe)", e)
+        return [], None
     if not cursos:
-        log.info("a4-notas: panel Materias vacío.")
-        return [], {}
+        log.info("a4-notas: panel Materias vacío (probable carga incompleta "
+                 "de a4 — snapshot NO se sobrescribe).")
+        return [], None
     log.info("a4-notas: %d curso(s) inscriptos.", len(cursos))
 
     # Instalar interceptor de XHR para capturar respuestas de los endpoints.
@@ -1049,8 +1060,20 @@ def fetch_and_notify_with_retry(chat_id: str, seen: set[str]) -> tuple[Optional[
             sent = fetch_and_notify(chat_id, seen)
             return sent, None
         except LoginFailed as e:
-            log.error("Login falló: %s", e)
-            return None, "login"
+            # Sólo tratamos como rechazo REAL si el primer intento del run
+            # falló. En reintentos suele ser falso positivo: UTN rechaza el
+            # segundo login porque se hizo a los segundos del primero (sesión
+            # zombie / rate-limit interno). Esos los tratamos como transient
+            # — no spameamos al usuario.
+            if attempt == 1:
+                log.error("Login falló (primer intento): %s", e)
+                return None, "login"
+            last_error = f"login-on-retry: {e}"
+            log.warning(
+                "Login rechazado en intento %d (probable falso positivo por "
+                "retry rápido tras error de red): %s",
+                attempt, e,
+            )
         except (TransientError, PWTimeout) as e:
             last_error = str(e)
             log.warning("Intento %d/%d transitorio: %s", attempt, MAX_ATTEMPTS, e)
