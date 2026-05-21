@@ -568,14 +568,29 @@ def _do_login(page: Page) -> None:
         raise TransientError(f"Timeout post-login: {e}")
     url     = page.url
     content = page.content()
-    rejected = (
-        ("logon" in url and "e=" in url)
-        or 'name="txtUsuario"' in content
-        or "Usuario o clave" in content
-    )
-    if rejected:
-        _save_debug(page, "login-rejected")
-        raise LoginFailed(f"Login rechazado por UTN (url={url})")
+    # 1) Mensaje de error explícito de UTN → credenciales realmente mal.
+    if "Usuario o clave" in content or "usuario o clave" in content:
+        _save_debug(page, "login-creds-error")
+        raise LoginFailed(
+            f"UTN reporta credenciales inválidas (url={url})"
+        )
+    # 2) URL con código de error en query string → rechazo explícito.
+    if "logon" in url and "e=" in url:
+        _save_debug(page, "login-rejected-url")
+        raise LoginFailed(
+            f"Login rechazado por UTN con código en URL (url={url})"
+        )
+    # 3) Cayó de vuelta en el form pero SIN mensaje de error → es un rebote
+    #    silencioso (rate-limit, sesión inválida, anti-bot, etc.). Lo tratamos
+    #    como transient para que el wrapper reintente y no llegue spam al
+    #    usuario — si las creds estuvieran realmente mal, UTN devolvería uno
+    #    de los dos casos de arriba.
+    if 'name="txtUsuario"' in content or 'id="txtUsuario"' in content:
+        _save_debug(page, "login-silent-bounce")
+        raise TransientError(
+            f"Submit cayó de vuelta en login sin mensaje de error "
+            f"(probable rate-limit / sesión zombie, url={url})"
+        )
     log.info("Login OK → %s", url)
 def _extract_a3(page: Page) -> list[dict]:
     """Lee el iframe NOTAS del dashboard academico3."""
